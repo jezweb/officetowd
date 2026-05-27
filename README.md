@@ -31,17 +31,25 @@ Manifest of last-known ETags + mtimes stored in `~/Documents/<town>/.officetowd/
 
 ## Status
 
-**Pre-alpha — scaffold only.** v1.1 deliverable per `office-town-cloud/.jez/artifacts/V1.1-PLAN-2026-05-28.md` Phase 2.1. Full implementation: ~1-2 weeks of focused Go work.
+**v0.1.0 — alpha.** The bisync engine, fsnotify watcher, SQLite manifest, R2 client, and CLI surface all build and pass unit tests against the local-walk + manifest paths.
 
-Tracked work:
+Tested:
 - [x] Repo scaffold + go.mod + cobra CLI entry point
-- [ ] fsnotify watcher
-- [ ] SQLite manifest
-- [ ] AWS SDK S3 client for R2
-- [ ] Bisync algorithm + conflict resolution
-- [ ] Worker notify-changed webhook
+- [x] fsnotify watcher with debounce + recursive dir tracking + ignore patterns
+- [x] SQLite manifest (path → hash + mtime + etag, WAL journal mode)
+- [x] AWS SDK S3 client against R2 endpoint (list, head, get, put, delete)
+- [x] Bisync engine — three-way compare (local + remote + manifest), upload/download/delete/conflict handling
+- [x] CLI: `configure`, `sync`, `start` (daemon), `status`, `resync`, `version`
+- [x] Unit tests for local walk + manifest roundtrip
+
+Not yet tested:
+- [ ] End-to-end against a real R2 bucket (needs your credentials)
+- [ ] Conflict resolution under concurrent edits
+- [ ] Worker re-index notification on push
+- [ ] Multi-machine convergence test (2+ machines syncing same bucket)
+- [ ] Performance on a real-world wiki (1000+ files)
 - [ ] Homebrew formula + GitHub Releases CI
-- [ ] Cross-platform testing (macOS arm64+amd64, Linux amd64+arm64, Windows amd64)
+- [ ] Cross-platform smoke (macOS arm64 only so far)
 
 ## Configuration
 
