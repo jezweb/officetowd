@@ -1,36 +1,42 @@
-// officetowd — local⇄R2 bisync daemon for Office Town wikis.
+// officetowd — local⇄worker bisync daemon for Office Town wikis.
 //
-// Subcommands: configure, start, sync, pull, push, status, version.
-// See ~/Documents/office-town-cloud/.jez/artifacts/officetowd-spec-2026-05-28.md
-// for the design.
+// Subcommands: configure, start, sync, status, resync, version.
+//
+// Architecture: all writes flow through the Office Town worker via
+// /api/sync/*. The daemon doesn't talk to R2 directly — the worker
+// proxies all R2 ops via its bindings, audits every change, and runs
+// frontmatter repair on the way through. The user never sees an R2
+// token; auth is just the MCP bearer.
 package main
 
 import (
 	"bufio"
-	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/jezweb/officetowd/internal/client"
 	"github.com/jezweb/officetowd/internal/config"
 	"github.com/jezweb/officetowd/internal/manifest"
-	"github.com/jezweb/officetowd/internal/r2"
 	syncpkg "github.com/jezweb/officetowd/internal/sync"
 	"github.com/jezweb/officetowd/internal/watcher"
 
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	root := &cobra.Command{
 		Use:   "officetowd",
-		Short: "Local⇄R2 bisync daemon for Office Town wikis",
-		Long:  "Watches a local town folder for changes and bisyncs to R2. Goanna-style.",
+		Short: "Office Town sync daemon — local ↔ worker bisync",
+		Long: "Watches a local folder for changes and bisyncs to the Office Town " +
+			"worker's /api/sync/* endpoints. The worker handles R2 + audit + " +
+			"frontmatter repair + indexing. Daemon's job is filesystem ↔ HTTP.",
 	}
 
 	root.AddCommand(cmdVersion())
@@ -57,62 +63,89 @@ func cmdVersion() *cobra.Command {
 }
 
 func cmdConfigure() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "configure",
 		Short: "Interactive config setup — writes ~/.officetowd/config.yaml",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			reader := bufio.NewReader(os.Stdin)
-			ask := func(prompt, def string) string {
-				if def != "" {
-					fmt.Printf("%s [%s]: ", prompt, def)
-				} else {
-					fmt.Printf("%s: ", prompt)
-				}
-				line, _ := reader.ReadString('\n')
-				line = strings.TrimSpace(line)
-				if line == "" {
-					return def
-				}
-				return line
-			}
-
-			fmt.Println("officetowd configure")
-			fmt.Println("====================")
-			fmt.Println()
-			fmt.Println("You'll need an R2 token scoped to the bucket. Generate one at")
-			fmt.Println("https://dash.cloudflare.com → R2 → Manage API tokens.")
-			fmt.Println()
-
-			c := &config.Config{
-				IntervalSeconds: 60,
-			}
-
-			c.Endpoint = ask("R2 endpoint (https://<account-id>.r2.cloudflarestorage.com)", "")
-			c.AccessKeyID = ask("Access Key ID", "")
-			c.SecretAccessKey = ask("Secret Access Key", "")
-			c.Bucket = ask("Bucket name (e.g. office-town-wiki)", "office-town-wiki")
-			c.LocalDir = ask("Local folder to bisync", "~/Documents/my-town")
-			c.Prefix = ask("Bucket prefix (optional, '' for whole bucket)", "")
-
-			if err := c.Validate(); err != nil {
-				return err
-			}
-			path, err := config.DefaultPath()
-			if err != nil {
-				return err
-			}
-			if err := config.Save(c, path); err != nil {
-				return err
-			}
-			fmt.Printf("\nConfig written to %s (mode 0600).\n", path)
-			fmt.Println("Run `officetowd start` to begin syncing.")
-			return nil
-		},
 	}
+	var fromDashboard string
+	c.Flags().StringVar(&fromDashboard, "from-dashboard", "", "Worker URL to fetch defaults from (e.g. https://my.office-town.workers.dev)")
+
+	c.RunE = func(cmd *cobra.Command, args []string) error {
+		reader := bufio.NewReader(os.Stdin)
+		ask := func(prompt, def string) string {
+			if def != "" {
+				fmt.Printf("%s [%s]: ", prompt, def)
+			} else {
+				fmt.Printf("%s: ", prompt)
+			}
+			line, _ := reader.ReadString('\n')
+			line = strings.TrimSpace(line)
+			if line == "" {
+				return def
+			}
+			return line
+		}
+
+		fmt.Println("officetowd configure")
+		fmt.Println("====================")
+		fmt.Println()
+		fmt.Println("You'll need:")
+		fmt.Println("  1. Your Office Town worker URL")
+		fmt.Println("  2. Your MCP bearer token (visible at <worker>/dashboard/connect)")
+		fmt.Println()
+
+		cfg := &config.Config{
+			IntervalSeconds: 60,
+		}
+
+		cfg.WorkerURL = ask("Worker URL", fromDashboard)
+
+		// If we have a URL, ping /api/sync/credentials to sanity-check
+		// before asking for the bearer.
+		if cfg.WorkerURL != "" {
+			pingURL := strings.TrimRight(cfg.WorkerURL, "/") + "/health"
+			req, _ := http.NewRequest(http.MethodGet, pingURL, nil)
+			req.Header.Set("User-Agent", "officetowd/"+version)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				fmt.Printf("  ! Couldn't reach %s — check the URL: %v\n", pingURL, err)
+			} else {
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					fmt.Printf("  ! %s returned %d — check the URL\n", pingURL, resp.StatusCode)
+				} else {
+					fmt.Printf("  ✓ %s reachable\n", pingURL)
+				}
+			}
+		}
+
+		cfg.Bearer = ask("MCP bearer token", "")
+		cfg.LocalDir = ask("Local folder to bisync", "~/Documents/my-town")
+		cfg.Prefix = ask("Path prefix in worker (e.g. wiki/ for wiki only, empty for everything)", "wiki/")
+
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+		path, err := config.DefaultPath()
+		if err != nil {
+			return err
+		}
+		if err := config.Save(cfg, path); err != nil {
+			return err
+		}
+		fmt.Printf("\n✓ Config written to %s (mode 0600).\n", path)
+		fmt.Println()
+		fmt.Println("Next:")
+		fmt.Println("  officetowd sync     # one-off sync to verify")
+		fmt.Println("  officetowd start    # run the daemon in foreground")
+		return nil
+	}
+	return c
 }
 
-// loadAll loads config + opens manifest + builds R2 client. Used by start/sync/status/resync.
-func loadAll(ctx context.Context) (*config.Config, *manifest.DB, *r2.Client, error) {
+// loadAll loads config + opens manifest + builds HTTP client. Used by
+// start/sync/status/resync.
+func loadAll() (*config.Config, *manifest.DB, *client.Client, error) {
 	cfg, err := config.Load("")
 	if err != nil {
 		return nil, nil, nil, err
@@ -121,12 +154,9 @@ func loadAll(ctx context.Context) (*config.Config, *manifest.DB, *r2.Client, err
 	if err != nil {
 		return cfg, nil, nil, err
 	}
-	c, err := r2.New(ctx, cfg.Endpoint, cfg.AccessKeyID, cfg.SecretAccessKey, cfg.Bucket)
-	if err != nil {
-		_ = m.Close()
-		return cfg, nil, nil, err
-	}
-	return cfg, m, c, nil
+	machineID, _ := os.Hostname()
+	cl := client.New(cfg.WorkerURL, cfg.Bearer, machineID)
+	return cfg, m, cl, nil
 }
 
 func cmdSync() *cobra.Command {
@@ -135,7 +165,7 @@ func cmdSync() *cobra.Command {
 		Short: "Run one bisync pass + exit",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			cfg, mfn, cl, err := loadAll(ctx)
+			cfg, mfn, cl, err := loadAll()
 			if err != nil {
 				return err
 			}
@@ -143,7 +173,7 @@ func cmdSync() *cobra.Command {
 			eng := &syncpkg.Engine{
 				LocalDir:       cfg.LocalDir,
 				Prefix:         cfg.Prefix,
-				R2:             cl,
+				Client:         cl,
 				Manifest:       mfn,
 				IgnorePrefixes: []string{".git", ".officetowd", "node_modules", ".DS_Store"},
 				Logf:           func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
@@ -168,7 +198,7 @@ func cmdStart() *cobra.Command {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 
-			cfg, mfn, cl, err := loadAll(ctx)
+			cfg, mfn, cl, err := loadAll()
 			if err != nil {
 				return err
 			}
@@ -177,7 +207,7 @@ func cmdStart() *cobra.Command {
 			eng := &syncpkg.Engine{
 				LocalDir:       cfg.LocalDir,
 				Prefix:         cfg.Prefix,
-				R2:             cl,
+				Client:         cl,
 				Manifest:       mfn,
 				IgnorePrefixes: []string{".git", ".officetowd", "node_modules", ".DS_Store"},
 				Logf:           func(f string, a ...any) { fmt.Printf("[sync] "+f+"\n", a...) },
@@ -209,8 +239,8 @@ func cmdStart() *cobra.Command {
 			ticker := time.NewTicker(time.Duration(cfg.IntervalSeconds) * time.Second)
 			defer ticker.Stop()
 
-			fmt.Printf("officetowd: watching %s ↔ %s/%s (interval %ds)\n",
-				cfg.LocalDir, cfg.Bucket, cfg.Prefix, cfg.IntervalSeconds)
+			fmt.Printf("officetowd: watching %s ↔ %s (prefix %q, interval %ds)\n",
+				cfg.LocalDir, cfg.WorkerURL, cfg.Prefix, cfg.IntervalSeconds)
 			fmt.Println("officetowd: Ctrl-C to stop")
 
 			for {
@@ -241,8 +271,7 @@ func cmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Show manifest stats + config summary",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			cfg, mfn, _, err := loadAll(ctx)
+			cfg, mfn, _, err := loadAll()
 			if err != nil {
 				return err
 			}
@@ -251,9 +280,9 @@ func cmdStatus() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			fmt.Printf("Worker:      %s\n", cfg.WorkerURL)
 			fmt.Printf("Local dir:   %s\n", cfg.LocalDir)
-			fmt.Printf("Bucket:      %s (prefix %q)\n", cfg.Bucket, cfg.Prefix)
-			fmt.Printf("Endpoint:    %s\n", cfg.Endpoint)
+			fmt.Printf("Prefix:      %q\n", cfg.Prefix)
 			fmt.Printf("Manifest:    %d entries\n", len(entries))
 			if len(entries) > 0 {
 				latest := entries[0].LastSyncedAt

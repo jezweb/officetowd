@@ -1,9 +1,12 @@
 // Package config loads and saves the officetowd configuration.
 //
-// The config lives at ~/.officetowd/config.yaml by default. It records the
-// R2 endpoint + access keys, the local town folder, and the bucket name.
-// Secrets are stored in the same file with file mode 0600; we don't
-// integrate with system keychains in v1 to keep the install story simple.
+// Config lives at ~/.officetowd/config.yaml by default. It records:
+//   - WorkerURL: the Office Town worker that proxies to R2
+//   - Bearer:    the MCP bearer token (same one used for the dashboard)
+//   - LocalDir:  the local folder to bisync
+//   - Prefix:    optional path prefix in the worker (e.g. "wiki/")
+//
+// No R2 credentials — the worker handles all R2 access via its bindings.
 package config
 
 import (
@@ -15,29 +18,28 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the on-disk shape. Fields tagged for YAML.
+// Config is the on-disk shape.
 type Config struct {
-	// Endpoint is the S3-compatible R2 endpoint, e.g.
-	//   https://<account-id>.r2.cloudflarestorage.com
-	Endpoint string `yaml:"endpoint"`
+	// WorkerURL is the Office Town worker base URL, e.g.
+	//   https://office-town.jezweb.workers.dev
+	// No trailing slash.
+	WorkerURL string `yaml:"worker_url"`
 
-	// AccessKeyID + SecretAccessKey are an R2 token scoped to the bucket.
-	AccessKeyID     string `yaml:"access_key_id"`
-	SecretAccessKey string `yaml:"secret_access_key"`
-
-	// Bucket is the R2 bucket name (e.g. "office-town-wiki").
-	Bucket string `yaml:"bucket"`
+	// Bearer is the MCP bearer token — same as the one used to wire
+	// MCPs into Goose. Visible at <worker>/dashboard/connect.
+	Bearer string `yaml:"bearer"`
 
 	// LocalDir is the local folder to bisync (e.g. ~/Documents/my-town).
 	// Stored as an absolute path; the loader expands ~/ on read.
 	LocalDir string `yaml:"local_dir"`
 
-	// Prefix limits the sync to a subtree of the bucket (e.g. "wiki/").
-	// Empty string syncs the whole bucket.
+	// Prefix limits the sync to a subtree of the worker's keyspace
+	// (e.g. "wiki/" for just the wiki bucket). Empty = whole worker
+	// (wiki + files).
 	Prefix string `yaml:"prefix"`
 
-	// IntervalSeconds is how often to do a passive scan in addition to
-	// fsnotify-triggered syncs. 0 disables periodic scans.
+	// IntervalSeconds is how often to do a passive sweep in addition
+	// to fsnotify-triggered syncs. 0 disables periodic scans.
 	IntervalSeconds int `yaml:"interval_seconds"`
 }
 
@@ -108,18 +110,13 @@ func Save(c *Config, path string) error {
 	return nil
 }
 
-// Validate returns an error if required fields are missing or obviously
-// wrong. Called by Load; callers building a Config from scratch should
-// call this themselves before Save.
+// Validate returns an error if required fields are missing.
 func (c *Config) Validate() error {
-	if c.Endpoint == "" {
-		return errors.New("endpoint is required (e.g. https://<account-id>.r2.cloudflarestorage.com)")
+	if c.WorkerURL == "" {
+		return errors.New("worker_url is required (e.g. https://office-town.<account>.workers.dev)")
 	}
-	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
-		return errors.New("access_key_id and secret_access_key are required")
-	}
-	if c.Bucket == "" {
-		return errors.New("bucket is required")
+	if c.Bearer == "" {
+		return errors.New("bearer is required (visible at <worker>/dashboard/connect)")
 	}
 	if c.LocalDir == "" {
 		return errors.New("local_dir is required")

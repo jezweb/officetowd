@@ -36,21 +36,20 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"mime"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jezweb/officetowd/internal/client"
 	"github.com/jezweb/officetowd/internal/manifest"
-	"github.com/jezweb/officetowd/internal/r2"
 )
 
 // Engine runs bisync cycles.
 type Engine struct {
 	LocalDir string
 	Prefix   string // optional — empty string means whole bucket
-	R2       *r2.Client
+	Client   *client.Client
 	Manifest *manifest.DB
 
 	// IgnorePrefixes mirrors the watcher's ignore set so we don't sync
@@ -77,11 +76,11 @@ func (e *Engine) Sync(ctx context.Context) (Stats, error) {
 	}
 	e.log("local: %d files", len(localFiles))
 
-	remoteObjs, err := e.R2.List(ctx, e.Prefix)
+	remoteObjs, err := e.Client.List(ctx, e.Prefix)
 	if err != nil {
 		return stats, fmt.Errorf("list remote: %w", err)
 	}
-	remote := make(map[string]r2.Object, len(remoteObjs))
+	remote := make(map[string]client.Object, len(remoteObjs))
 	for _, o := range remoteObjs {
 		rel := strings.TrimPrefix(o.Key, e.Prefix)
 		remote[rel] = o
@@ -178,11 +177,11 @@ type action struct {
 
 	// Cached state to avoid re-stat / re-head during apply.
 	LocalInfo  *localFile
-	RemoteInfo *r2.Object
+	RemoteInfo *client.Object
 	ManEntry   *manifest.Entry
 }
 
-func (e *Engine) decide(ctx context.Context, path string, localFiles map[string]*localFile, remote map[string]r2.Object) (action, error) {
+func (e *Engine) decide(ctx context.Context, path string, localFiles map[string]*localFile, remote map[string]client.Object) (action, error) {
 	a := action{Path: path}
 	loc, locOK := localFiles[path]
 	rem, remOK := remote[path]
@@ -281,26 +280,30 @@ func (e *Engine) doUpload(ctx context.Context, a action) error {
 	if err != nil {
 		return fmt.Errorf("read local: %w", err)
 	}
-	ctype := mime.TypeByExtension(filepath.Ext(a.Path))
-	obj, err := e.R2.Put(ctx, e.Prefix+a.Path, body, ctype)
+	reason := "filesystem-sync upload"
+	pr, err := e.Client.Put(ctx, e.Prefix+a.Path, body, reason)
 	if err != nil {
 		return err
 	}
-	e.log("UP   %s (%d B, etag %s)", a.Path, len(body), obj.ETag)
+	if pr.Repaired {
+		e.log("UP   %s (%d B, etag %s) — server repaired frontmatter: %s", a.Path, len(body), pr.ETag, pr.RepairNote)
+	} else {
+		e.log("UP   %s (%d B, etag %s)", a.Path, len(body), pr.ETag)
+	}
 	return e.Manifest.Put(&manifest.Entry{
 		Path:           a.Path,
 		LocalHash:      a.LocalInfo.Hash,
 		LocalMtime:     a.LocalInfo.Mtime,
 		LocalSize:      a.LocalInfo.Size,
-		RemoteETag:     obj.ETag,
-		RemoteModified: obj.LastModified,
-		RemoteSize:     obj.Size,
+		RemoteETag:     pr.ETag,
+		RemoteModified: time.Now(),
+		RemoteSize:     pr.Size,
 		LastSyncedAt:   time.Now(),
 	})
 }
 
 func (e *Engine) doDownload(ctx context.Context, a action) error {
-	body, obj, err := e.R2.Get(ctx, e.Prefix+a.Path)
+	body, obj, err := e.Client.Get(ctx, e.Prefix+a.Path)
 	if err != nil {
 		return err
 	}
@@ -339,7 +342,7 @@ func (e *Engine) doDeleteLocal(a action) error {
 }
 
 func (e *Engine) doDeleteRemote(ctx context.Context, a action) error {
-	if err := e.R2.Delete(ctx, e.Prefix+a.Path); err != nil {
+	if err := e.Client.Delete(ctx, e.Prefix+a.Path, "filesystem-sync delete"); err != nil {
 		return err
 	}
 	e.log("DEL  %s (remote)", a.Path)
@@ -353,7 +356,7 @@ func (e *Engine) doConflict(ctx context.Context, a action) error {
 	//   2. Write them to <path>.conflict-<unix-ts> locally.
 	//   3. Upload the (still untouched) local bytes as the authoritative
 	//      copy. The user gets both files and can resolve manually.
-	remoteBody, _, err := e.R2.Get(ctx, e.Prefix+a.Path)
+	remoteBody, _, err := e.Client.Get(ctx, e.Prefix+a.Path)
 	if err != nil {
 		return fmt.Errorf("fetch remote for conflict: %w", err)
 	}
