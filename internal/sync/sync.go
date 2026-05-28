@@ -39,6 +39,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	gosync "sync"
 	"time"
 
 	"github.com/jezweb/officetowd/internal/client"
@@ -103,23 +104,59 @@ func (e *Engine) Sync(ctx context.Context) (Stats, error) {
 		allPaths[p] = struct{}{}
 	}
 
+	// Cap concurrent apply ops at 8. Decide step is cheap (just SQLite +
+	// in-memory maps) so we run it serially; the heavy lifting is in
+	// apply (R2 HTTP I/O via the worker), which parallelises well.
+	type job struct {
+		action action
+		decideErr error
+	}
+	jobs := make([]job, 0, len(allPaths))
 	for path := range allPaths {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
 		}
-		action, err := e.decide(ctx, path, localFiles, remote)
-		if err != nil {
-			e.log("error deciding for %s: %v", path, err)
-			stats.Errors++
-			continue
-		}
-		if err := e.apply(ctx, action); err != nil {
-			e.log("error applying %s for %s: %v", action.Op, path, err)
-			stats.Errors++
-			continue
-		}
-		stats.bump(action.Op)
+		a, err := e.decide(ctx, path, localFiles, remote)
+		jobs = append(jobs, job{action: a, decideErr: err})
 	}
+
+	const concurrency = 8
+	sem := make(chan struct{}, concurrency)
+	var mu gosync.Mutex // protects stats (Stats has int fields, easier to lock than convert to atomics)
+	wg := gosync.WaitGroup{}
+	for i := range jobs {
+		j := &jobs[i]
+		if j.decideErr != nil {
+			e.log("error deciding for %s: %v", j.action.Path, j.decideErr)
+			mu.Lock()
+			stats.Errors++
+			mu.Unlock()
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j *job) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				mu.Lock()
+				stats.Errors++
+				mu.Unlock()
+				return
+			}
+			if err := e.apply(ctx, j.action); err != nil {
+				e.log("error applying %s for %s: %v", j.action.Op, j.action.Path, err)
+				mu.Lock()
+				stats.Errors++
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			stats.bump(j.action.Op)
+			mu.Unlock()
+		}(j)
+	}
+	wg.Wait()
 	return stats, nil
 }
 
