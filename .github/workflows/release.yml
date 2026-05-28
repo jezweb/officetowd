@@ -5,9 +5,12 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write  # required to create the GitHub release
+
 jobs:
-  release:
-    name: Cross-platform build + GitHub release
+  build:
+    name: Build cross-platform binaries
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -37,3 +40,24 @@ jobs:
         with:
           name: officetowd-${{ matrix.target.goos }}-${{ matrix.target.goarch }}
           path: officetowd-${{ matrix.target.goos }}-${{ matrix.target.goarch }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: officetowd-*
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/officetowd-*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

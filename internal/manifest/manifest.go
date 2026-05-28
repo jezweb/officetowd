@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // Entry is one row of the manifest. Path is relative to the configured
@@ -55,7 +55,7 @@ func Open(path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir parent: %w", err)
 	}
-	db, err := sql.Open("sqlite3", "file:"+path+"?_journal=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", "file:"+path+"?_journal=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
