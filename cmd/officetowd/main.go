@@ -25,6 +25,7 @@ import (
 	"github.com/jezweb/officetowd/internal/config"
 	"github.com/jezweb/officetowd/internal/manifest"
 	"github.com/jezweb/officetowd/internal/selfupdate"
+	"github.com/jezweb/officetowd/internal/service"
 	syncpkg "github.com/jezweb/officetowd/internal/sync"
 	"github.com/jezweb/officetowd/internal/watcher"
 
@@ -51,6 +52,8 @@ func main() {
 	root.AddCommand(cmdStatus())
 	root.AddCommand(cmdResync())
 	root.AddCommand(cmdUpdate())
+	root.AddCommand(cmdInstallService())
+	root.AddCommand(cmdUninstallService())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -64,6 +67,29 @@ func cmdVersion() *cobra.Command {
 		Short: "Print officetowd version",
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println(version)
+		},
+	}
+}
+
+func cmdInstallService() *cobra.Command {
+	var printOnly bool
+	c := &cobra.Command{
+		Use:   "install-service",
+		Short: "Install officetowd as a background service (auto-start on login/reboot)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return service.Install(printOnly)
+		},
+	}
+	c.Flags().BoolVar(&printOnly, "print", false, "Print the unit file instead of installing it")
+	return c
+}
+
+func cmdUninstallService() *cobra.Command {
+	return &cobra.Command{
+		Use:   "uninstall-service",
+		Short: "Remove the officetowd background service",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return service.Uninstall()
 		},
 	}
 }
