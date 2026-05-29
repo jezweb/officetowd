@@ -107,10 +107,6 @@ func (e *Engine) Sync(ctx context.Context) (Stats, error) {
 	// Cap concurrent apply ops at 8. Decide step is cheap (just SQLite +
 	// in-memory maps) so we run it serially; the heavy lifting is in
 	// apply (R2 HTTP I/O via the worker), which parallelises well.
-	type job struct {
-		action action
-		decideErr error
-	}
 	jobs := make([]job, 0, len(allPaths))
 	for path := range allPaths {
 		if ctx.Err() != nil {
@@ -120,37 +116,26 @@ func (e *Engine) Sync(ctx context.Context) (Stats, error) {
 		jobs = append(jobs, job{action: a, decideErr: err})
 	}
 
-	// Mass-deletion safety valve. If the local folder vanished or was emptied
-	// (moved, accidental rm, disk fault) while the manifest still records the
-	// files, the bisync logic reads that as "user deleted everything locally"
-	// and would propagate the deletions to the remote — wiping the cortex.
-	// Refuse to apply remote deletions when they'd remove all (or most) of the
-	// remote. Downloads/uploads still proceed; only the destructive deletes are
-	// held. The user re-runs after investigating, or restores the local folder.
-	plannedRemoteDeletes := 0
-	for i := range jobs {
-		if jobs[i].decideErr == nil && jobs[i].action.Op == opDeleteRemote {
-			plannedRemoteDeletes++
-		}
-	}
-	deleteCeiling := len(remote) / 2
-	if deleteCeiling < 10 {
-		deleteCeiling = 10
-	}
-	if plannedRemoteDeletes > deleteCeiling && plannedRemoteDeletes > 0 {
+	// Mass-deletion safety valve — see enforceDeleteSafetyValve. Holds deletes
+	// in either direction when they'd remove most of a side; logs why.
+	heldRemote, heldLocal := enforceDeleteSafetyValve(jobs, len(remote), len(localFiles))
+	if heldRemote > 0 {
 		e.log("")
-		e.log("⚠ SAFETY STOP: this sync would delete %d of %d remote objects.", plannedRemoteDeletes, len(remote))
+		e.log("⚠ SAFETY STOP: this sync would delete %d of %d REMOTE objects.", heldRemote, len(remote))
 		e.log("  That usually means the local folder was moved, emptied, or lost —")
 		e.log("  not that you meant to delete your whole cortex. Holding the deletions.")
-		e.log("  If the local folder is genuinely gone, restore it (or re-run the")
-		e.log("  installer to re-pull), then sync again. If you really did mean to")
-		e.log("  clear the remote, delete entries from the dashboard instead.")
+		e.log("  Restore the local folder (or re-run the installer to re-pull), then")
+		e.log("  sync again. To clear the remote on purpose, use the dashboard.")
 		e.log("")
-		for i := range jobs {
-			if jobs[i].decideErr == nil && jobs[i].action.Op == opDeleteRemote {
-				jobs[i].action.Op = opNoop
-			}
-		}
+	}
+	if heldLocal > 0 {
+		e.log("")
+		e.log("⚠ SAFETY STOP: this sync would delete %d of %d LOCAL files.", heldLocal, len(localFiles))
+		e.log("  That usually means the remote listing came back empty or short —")
+		e.log("  a transient server hiccup or a misconfigured prefix — not that the")
+		e.log("  cortex was really cleared. Holding the deletions to protect your")
+		e.log("  local copy. Check your connection / config and sync again.")
+		e.log("")
 	}
 
 	const concurrency = 8
@@ -229,6 +214,59 @@ func (s Stats) String() string {
 }
 
 // ---------- decision + apply ----------
+
+// job pairs a decided action with any error from deciding it.
+type job struct {
+	action    action
+	decideErr error
+}
+
+// safetyCeiling is the most deletions we'll allow on one side before treating
+// the batch as a likely accident: half the side, floored at 10 so small
+// cortexes can still have a few files legitimately removed.
+func safetyCeiling(sideCount int) int {
+	if c := sideCount / 2; c > 10 {
+		return c
+	}
+	return 10
+}
+
+// enforceDeleteSafetyValve holds mass-deletion operations in EITHER direction,
+// because data loss is symmetric. If planned remote deletions exceed the remote
+// ceiling (local folder went missing → don't wipe the remote) or planned local
+// deletions exceed the local ceiling (remote listing came back empty/short →
+// don't wipe the local copy), those deletes are converted to noop. Pure: no
+// I/O, so it's unit-testable. Returns how many were held each way.
+func enforceDeleteSafetyValve(jobs []job, lenRemote, lenLocal int) (heldRemote, heldLocal int) {
+	var plannedRemote, plannedLocal int
+	for i := range jobs {
+		if jobs[i].decideErr != nil {
+			continue
+		}
+		switch jobs[i].action.Op {
+		case opDeleteRemote:
+			plannedRemote++
+		case opDeleteLocal:
+			plannedLocal++
+		}
+	}
+	holdRemote := plannedRemote > safetyCeiling(lenRemote)
+	holdLocal := plannedLocal > safetyCeiling(lenLocal)
+	for i := range jobs {
+		if jobs[i].decideErr != nil {
+			continue
+		}
+		if holdRemote && jobs[i].action.Op == opDeleteRemote {
+			jobs[i].action.Op = opNoop
+			heldRemote++
+		}
+		if holdLocal && jobs[i].action.Op == opDeleteLocal {
+			jobs[i].action.Op = opNoop
+			heldLocal++
+		}
+	}
+	return heldRemote, heldLocal
+}
 
 type opCode int
 
