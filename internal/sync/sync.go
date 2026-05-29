@@ -120,6 +120,39 @@ func (e *Engine) Sync(ctx context.Context) (Stats, error) {
 		jobs = append(jobs, job{action: a, decideErr: err})
 	}
 
+	// Mass-deletion safety valve. If the local folder vanished or was emptied
+	// (moved, accidental rm, disk fault) while the manifest still records the
+	// files, the bisync logic reads that as "user deleted everything locally"
+	// and would propagate the deletions to the remote — wiping the cortex.
+	// Refuse to apply remote deletions when they'd remove all (or most) of the
+	// remote. Downloads/uploads still proceed; only the destructive deletes are
+	// held. The user re-runs after investigating, or restores the local folder.
+	plannedRemoteDeletes := 0
+	for i := range jobs {
+		if jobs[i].decideErr == nil && jobs[i].action.Op == opDeleteRemote {
+			plannedRemoteDeletes++
+		}
+	}
+	deleteCeiling := len(remote) / 2
+	if deleteCeiling < 10 {
+		deleteCeiling = 10
+	}
+	if plannedRemoteDeletes > deleteCeiling && plannedRemoteDeletes > 0 {
+		e.log("")
+		e.log("⚠ SAFETY STOP: this sync would delete %d of %d remote objects.", plannedRemoteDeletes, len(remote))
+		e.log("  That usually means the local folder was moved, emptied, or lost —")
+		e.log("  not that you meant to delete your whole cortex. Holding the deletions.")
+		e.log("  If the local folder is genuinely gone, restore it (or re-run the")
+		e.log("  installer to re-pull), then sync again. If you really did mean to")
+		e.log("  clear the remote, delete entries from the dashboard instead.")
+		e.log("")
+		for i := range jobs {
+			if jobs[i].decideErr == nil && jobs[i].action.Op == opDeleteRemote {
+				jobs[i].action.Op = opNoop
+			}
+		}
+	}
+
 	const concurrency = 8
 	sem := make(chan struct{}, concurrency)
 	var mu gosync.Mutex // protects stats (Stats has int fields, easier to lock than convert to atomics)

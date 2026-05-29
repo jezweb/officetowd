@@ -59,6 +59,12 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// The sync engine applies ops at concurrency 8, each upserting the
+	// manifest. SQLite allows only one writer; multiple pooled connections
+	// race and time out with SQLITE_BUSY. Funnel all manifest access through
+	// a single connection so the Go sql layer queues writes instead. Manifest
+	// ops are tiny, so serialising them costs nothing measurable.
+	db.SetMaxOpenConns(1)
 	m := &DB{db: db}
 	if err := m.applySchema(); err != nil {
 		_ = db.Close()
