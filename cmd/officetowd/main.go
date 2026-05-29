@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -402,9 +404,81 @@ func cmdStart() *cobra.Command {
 						// not on every file-change sync, so heartbeats stay bounded.
 						_ = cl.Heartbeat(ctx, version, stats)
 					}
+					// Pick up any cloud→local jobs (webhook/schedule-triggered
+					// workflows) targeted at this device and run them locally.
+					runClaimedJobs(ctx, cl)
 				}
 			}
 		},
+	}
+}
+
+// findGoose locates the goose CLI — daemon PATH (launchd/systemd) often lacks
+// the user's bin dirs, so check the usual install locations too.
+func findGoose() string {
+	if p, err := exec.LookPath("goose"); err == nil {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	for _, p := range []string{
+		filepath.Join(home, ".local", "bin", "goose"),
+		"/opt/homebrew/bin/goose",
+		"/usr/local/bin/goose",
+	} {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// runClaimedJobs polls the worker for jobs targeted at this device and runs each
+// one through a headless Goose (which has the owner's provider + connectors +
+// the office-town MCPs), then reports the outcome. Fire-and-forget per job; a
+// failed/slow job never blocks syncing.
+func runClaimedJobs(ctx context.Context, cl *client.Client) {
+	jobs, err := cl.PollJobs(ctx)
+	if err != nil || len(jobs) == 0 {
+		return
+	}
+	goosePath := findGoose()
+	for _, j := range jobs {
+		go func(job client.Job) {
+			if goosePath == "" {
+				_ = cl.ReportJob(ctx, job.JobID, "failed", "goose CLI not found on this machine")
+				return
+			}
+			payload := string(job.Payload)
+			if payload == "" || payload == "null" {
+				payload = "(none)"
+			}
+			instr := fmt.Sprintf(
+				"You are running an Office Town workflow as a background job. Your cortex (wiki + files) "+
+					"lives in the CLOUD and is reached ONLY through your office-town MCP tools — never the local "+
+					"filesystem or shell. Do NOT run shell commands or inspect local files.\n"+
+					"Steps: (1) Use the files tool to read 'workflows/%s/workflow.md' from the cortex — that is the "+
+					"goal. (2) Do exactly what it says, using the wiki + files tools. (3) Respect its trust tier: "+
+					"leave anything outward or lossy as a draft in 'workflows/%s/pending/' — never send/publish/"+
+					"delete without an OK. (4) Append a one-line receipt to 'workflows/%s/log.md'.\n"+
+					"This run was triggered externally with payload: %s. Be brief.",
+				job.WorkflowSlug, job.WorkflowSlug, job.WorkflowSlug, payload,
+			)
+			jctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer cancel()
+			cmd := exec.CommandContext(jctx, goosePath, "run", "--no-session", "--text", instr)
+			cmd.Dir = os.TempDir() // neutral cwd — the cortex is in the cloud, not local files
+			out, err := cmd.CombinedOutput()
+			status := "done"
+			if err != nil {
+				status = "failed"
+			}
+			result := strings.TrimSpace(string(out))
+			if len(result) > 1500 {
+				result = result[len(result)-1500:]
+			}
+			_ = cl.ReportJob(ctx, job.JobID, status, result)
+			fmt.Printf("[job] %s %s (%s)\n", job.WorkflowSlug, status, job.JobID)
+		}(j)
 	}
 }
 

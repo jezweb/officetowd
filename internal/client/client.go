@@ -287,6 +287,54 @@ func (c *Client) Heartbeat(ctx context.Context, version string, stats any) error
 	return nil
 }
 
+// Job is a unit of work the worker hands to this device (cloud→local bridge).
+type Job struct {
+	JobID        string          `json:"job_id"`
+	WorkflowSlug string          `json:"workflow_slug"`
+	Payload      json.RawMessage `json:"payload"`
+	Source       string          `json:"source"`
+}
+
+// PollJobs claims up to a few pending jobs targeted at this device. The worker
+// marks them claimed atomically, so two polls won't double-run a job.
+func (c *Client) PollJobs(ctx context.Context) ([]Job, error) {
+	req, err := c.authedRequest(ctx, http.MethodGet, "/api/jobs/poll", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("poll jobs: %d", resp.StatusCode)
+	}
+	var out struct {
+		Jobs []Job `json:"jobs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Jobs, nil
+}
+
+// ReportJob tells the worker a job finished (status "done" or "failed").
+func (c *Client) ReportJob(ctx context.Context, jobID, status, result string) error {
+	body, _ := json.Marshal(map[string]string{"status": status, "result": result})
+	req, err := c.authedRequest(ctx, http.MethodPost, "/api/jobs/"+jobID+"/result", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 // Credentials describes what `officetowd configure --from-dashboard` fetches.
 type Credentials struct {
 	WorkerURL  string `json:"worker_url"`
