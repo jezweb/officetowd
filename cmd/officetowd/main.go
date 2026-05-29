@@ -406,7 +406,7 @@ func cmdStart() *cobra.Command {
 					}
 					// Pick up any cloud→local jobs (webhook/schedule-triggered
 					// workflows) targeted at this device and run them locally.
-					runClaimedJobs(ctx, cl)
+					runClaimedJobs(ctx, cl, cfg.LocalDir)
 				}
 			}
 		},
@@ -436,7 +436,7 @@ func findGoose() string {
 // one through a headless Goose (which has the owner's provider + connectors +
 // the office-town MCPs), then reports the outcome. Fire-and-forget per job; a
 // failed/slow job never blocks syncing.
-func runClaimedJobs(ctx context.Context, cl *client.Client) {
+func runClaimedJobs(ctx context.Context, cl *client.Client, localDir string) {
 	jobs, err := cl.PollJobs(ctx)
 	if err != nil || len(jobs) == 0 {
 		return
@@ -449,23 +449,36 @@ func runClaimedJobs(ctx context.Context, cl *client.Client) {
 				return
 			}
 			payload := string(job.Payload)
-			if payload == "" || payload == "null" {
-				payload = "(none)"
+			recipePath := filepath.Join(localDir, "workflows", job.WorkflowSlug, "recipe.yaml")
+
+			var args []string
+			if _, statErr := os.Stat(recipePath); statErr == nil {
+				// A Workflow is a Goose recipe — run it directly. It inherits the
+				// configured office-town MCPs (the recipe declares no extensions).
+				args = []string{"run", "--no-session", "--recipe", recipePath}
+				if payload != "" && payload != "null" {
+					args = append(args, "--params", "payload="+payload)
+				}
+			} else {
+				// Recipe not synced locally — fall back to instructing the agent to
+				// read it from the cortex via the files tool.
+				if payload == "" || payload == "null" {
+					payload = "(none)"
+				}
+				instr := fmt.Sprintf(
+					"Run the Office Town workflow %q. Use ONLY your office-town MCP tools (the cortex is in the "+
+						"cloud, not local files). Read 'workflows/%s/recipe.yaml' with the files tool — its "+
+						"'instructions:' are the goal — then do it, respecting the workflow's trust (drafts to "+
+						"workflows/%s/pending/, never send/publish/delete without an OK) and appending a one-line "+
+						"receipt to workflows/%s/log.md. Triggered with payload: %s. Be brief.",
+					job.WorkflowSlug, job.WorkflowSlug, job.WorkflowSlug, job.WorkflowSlug, payload,
+				)
+				args = []string{"run", "--no-session", "--text", instr}
 			}
-			instr := fmt.Sprintf(
-				"You are running an Office Town workflow as a background job. Your cortex (wiki + files) "+
-					"lives in the CLOUD and is reached ONLY through your office-town MCP tools — never the local "+
-					"filesystem or shell. Do NOT run shell commands or inspect local files.\n"+
-					"Steps: (1) Use the files tool to read 'workflows/%s/workflow.md' from the cortex — that is the "+
-					"goal. (2) Do exactly what it says, using the wiki + files tools. (3) Respect its trust tier: "+
-					"leave anything outward or lossy as a draft in 'workflows/%s/pending/' — never send/publish/"+
-					"delete without an OK. (4) Append a one-line receipt to 'workflows/%s/log.md'.\n"+
-					"This run was triggered externally with payload: %s. Be brief.",
-				job.WorkflowSlug, job.WorkflowSlug, job.WorkflowSlug, payload,
-			)
+
 			jctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 			defer cancel()
-			cmd := exec.CommandContext(jctx, goosePath, "run", "--no-session", "--text", instr)
+			cmd := exec.CommandContext(jctx, goosePath, args...)
 			cmd.Dir = os.TempDir() // neutral cwd — the cortex is in the cloud, not local files
 			out, err := cmd.CombinedOutput()
 			status := "done"
