@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -35,11 +36,12 @@ type Client struct {
 	BaseURL   string // e.g. https://office-town.jezweb.workers.dev
 	Bearer    string
 	MachineID string // forwarded as X-Office-Town-Machine for audit log
+	DeviceID  string // forwarded as X-Office-Town-Device — stable machine identity
 	http      *http.Client
 }
 
 // New constructs a Client. baseURL must NOT have a trailing slash.
-func New(baseURL, bearer, machineID string) *Client {
+func New(baseURL, bearer, machineID, deviceID string) *Client {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if machineID == "" {
 		// Best-effort machine fingerprint — hostname is fine for the
@@ -54,6 +56,7 @@ func New(baseURL, bearer, machineID string) *Client {
 		BaseURL:   baseURL,
 		Bearer:    bearer,
 		MachineID: machineID,
+		DeviceID:  deviceID,
 		http:      &http.Client{Timeout: 60 * time.Second},
 	}
 }
@@ -89,6 +92,9 @@ func (c *Client) authedRequest(ctx context.Context, method, path string, body io
 	req.Header.Set("Authorization", "Bearer "+c.Bearer)
 	if c.MachineID != "" {
 		req.Header.Set("X-Office-Town-Machine", c.MachineID)
+	}
+	if c.DeviceID != "" {
+		req.Header.Set("X-Office-Town-Device", c.DeviceID)
 	}
 	return req, nil
 }
@@ -257,9 +263,10 @@ func (c *Client) Delete(ctx context.Context, key, reason string) error {
 // missed heartbeat must never affect syncing).
 func (c *Client) Heartbeat(ctx context.Context, version string, stats any) error {
 	payload, err := json.Marshal(map[string]any{
-		"machine": c.MachineID,
-		"version": version,
-		"stats":   stats,
+		"machine":  c.MachineID,
+		"version":  version,
+		"platform": runtime.GOOS + "/" + runtime.GOARCH,
+		"stats":    stats,
 	})
 	if err != nil {
 		return err

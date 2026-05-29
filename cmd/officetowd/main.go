@@ -23,6 +23,7 @@ import (
 
 	"github.com/jezweb/officetowd/internal/client"
 	"github.com/jezweb/officetowd/internal/config"
+	"github.com/jezweb/officetowd/internal/identity"
 	"github.com/jezweb/officetowd/internal/manifest"
 	"github.com/jezweb/officetowd/internal/selfupdate"
 	"github.com/jezweb/officetowd/internal/service"
@@ -54,6 +55,7 @@ func main() {
 	root.AddCommand(cmdUpdate())
 	root.AddCommand(cmdInstallService())
 	root.AddCommand(cmdUninstallService())
+	root.AddCommand(cmdDeviceID())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -82,6 +84,21 @@ func cmdInstallService() *cobra.Command {
 	}
 	c.Flags().BoolVar(&printOnly, "print", false, "Print the unit file instead of installing it")
 	return c
+}
+
+func cmdDeviceID() *cobra.Command {
+	return &cobra.Command{
+		Use:   "device-id",
+		Short: "Print this machine's device id (minting one on first run)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := identity.DeviceID()
+			if err != nil {
+				return err
+			}
+			fmt.Println(id)
+			return nil
+		},
+	}
 }
 
 func cmdUninstallService() *cobra.Command {
@@ -262,7 +279,8 @@ func loadAll() (*config.Config, *manifest.DB, *client.Client, error) {
 		return cfg, nil, nil, err
 	}
 	machineID, _ := os.Hostname()
-	cl := client.New(cfg.WorkerURL, cfg.Bearer, machineID)
+	deviceID, _ := identity.DeviceID()
+	cl := client.New(cfg.WorkerURL, cfg.Bearer, machineID, deviceID)
 	return cfg, m, cl, nil
 }
 
