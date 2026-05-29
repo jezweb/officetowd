@@ -11,6 +11,8 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,13 +24,16 @@ import (
 	"github.com/jezweb/officetowd/internal/client"
 	"github.com/jezweb/officetowd/internal/config"
 	"github.com/jezweb/officetowd/internal/manifest"
+	"github.com/jezweb/officetowd/internal/selfupdate"
 	syncpkg "github.com/jezweb/officetowd/internal/sync"
 	"github.com/jezweb/officetowd/internal/watcher"
 
 	"github.com/spf13/cobra"
 )
 
-const version = "0.2.0"
+// version is injected at build time via -ldflags "-X main.version=<tag>".
+// Defaults to "dev" for local builds (which self-update treats as always-stale).
+var version = "dev"
 
 func main() {
 	root := &cobra.Command{
@@ -45,6 +50,7 @@ func main() {
 	root.AddCommand(cmdSync())
 	root.AddCommand(cmdStatus())
 	root.AddCommand(cmdResync())
+	root.AddCommand(cmdUpdate())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -60,6 +66,81 @@ func cmdVersion() *cobra.Command {
 			fmt.Println(version)
 		},
 	}
+}
+
+func cmdUpdate() *cobra.Command {
+	return &cobra.Command{
+		Use:   "update",
+		Short: "Check for a newer release and install it",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runAutoUpdate(cmd.Context(), true)
+			return nil
+		},
+	}
+}
+
+// runAutoUpdate checks for a newer release and, if found, installs it and
+// re-execs the daemon with the same args. Never fatal: network errors,
+// permission issues, and bad downloads all degrade to a log line and false.
+// Returns true only if an update was attempted (it normally re-execs and never
+// returns). manual=true forces the check even for "dev" builds / opt-out.
+func runAutoUpdate(ctx context.Context, manual bool) bool {
+	if !manual {
+		if version == "dev" {
+			return false // local build — don't clobber it
+		}
+		if os.Getenv("OFFICETOWD_NO_AUTOUPDATE") != "" {
+			return false
+		}
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	rel, err := selfupdate.Latest(cctx)
+	if err != nil {
+		if manual {
+			fmt.Fprintln(os.Stderr, "update check failed:", err)
+		}
+		return false
+	}
+	if !selfupdate.IsNewer(version, rel.Tag) {
+		if manual {
+			fmt.Printf("officetowd is up to date (%s).\n", version)
+		}
+		return false
+	}
+
+	fmt.Printf("officetowd: update available %s → %s, installing...\n", version, rel.Tag)
+	path, err := selfupdate.Apply(cctx, rel)
+	if err != nil {
+		var nw *selfupdate.NotWritableError
+		if errors.As(err, &nw) {
+			fmt.Printf("officetowd: %s is newer but I can't replace %s (no write permission).\n", rel.Tag, nw.Path)
+			fmt.Println("  Update manually by re-running the installer one-liner from <worker>/dashboard/connect")
+		} else {
+			fmt.Fprintf(os.Stderr, "officetowd: auto-update to %s failed: %v (staying on %s)\n", rel.Tag, err, version)
+		}
+		return false
+	}
+
+	if manual {
+		// One-shot `update`: don't re-exec (the new binary may have a different
+		// CLI). Just report; the user's daemon, if running, will reload on its
+		// next restart or daily check.
+		fmt.Printf("officetowd: updated to %s. Restart 'officetowd start' to use it.\n", rel.Tag)
+		return true
+	}
+
+	fmt.Printf("officetowd: updated to %s, restarting...\n", rel.Tag)
+	// Daemon path: re-exec the freshly-installed binary with the same args + env
+	// so the long-running process picks up the new code. 'start' exists in every
+	// version, so re-execing it is safe.
+	if err := syscall.Exec(path, os.Args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "officetowd: updated but couldn't restart automatically (%v) — please restart officetowd.\n", err)
+		os.Exit(0)
+	}
+	return true
 }
 
 func cmdConfigure() *cobra.Command {
@@ -198,6 +279,10 @@ func cmdStart() *cobra.Command {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 
+			// Self-update before doing anything else, so a daemon left running
+			// for weeks still picks up safety fixes. Re-execs on success.
+			runAutoUpdate(ctx, false)
+
 			cfg, mfn, cl, err := loadAll()
 			if err != nil {
 				return err
@@ -239,6 +324,10 @@ func cmdStart() *cobra.Command {
 			ticker := time.NewTicker(time.Duration(cfg.IntervalSeconds) * time.Second)
 			defer ticker.Stop()
 
+			// Daily self-update check for long-running daemons. Re-execs on success.
+			updateTicker := time.NewTicker(24 * time.Hour)
+			defer updateTicker.Stop()
+
 			fmt.Printf("officetowd: watching %s ↔ %s (prefix %q, interval %ds)\n",
 				cfg.LocalDir, cfg.WorkerURL, cfg.Prefix, cfg.IntervalSeconds)
 			fmt.Println("officetowd: Ctrl-C to stop")
@@ -248,6 +337,8 @@ func cmdStart() *cobra.Command {
 				case <-ctx.Done():
 					fmt.Println("\nofficetowd: shutting down")
 					return nil
+				case <-updateTicker.C:
+					runAutoUpdate(ctx, false)
 				case <-w.Changes():
 					if stats, err := eng.Sync(ctx); err != nil {
 						fmt.Fprintln(os.Stderr, "[sync] error:", err)

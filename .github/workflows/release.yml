@@ -30,11 +30,12 @@ jobs:
           GOOS: ${{ matrix.target.goos }}
           GOARCH: ${{ matrix.target.goarch }}
           CGO_ENABLED: '0'
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           ext=""
           if [ "${{ matrix.target.goos }}" = "windows" ]; then ext=".exe"; fi
-          go build -ldflags="-s -w" -o dist/officetowd${ext} ./cmd/officetowd
+          go build -ldflags="-s -w -X main.version=${VERSION}" -o dist/officetowd${ext} ./cmd/officetowd
           tar czf officetowd-${{ matrix.target.goos }}-${{ matrix.target.goarch }}.tar.gz -C dist officetowd${ext}
       - uses: actions/upload-artifact@v4
         with:
@@ -55,9 +56,16 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -la dist/
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum officetowd-*.tar.gz > checksums.txt
+          cat checksums.txt
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/officetowd-*.tar.gz
+          files: |
+            dist/officetowd-*.tar.gz
+            dist/checksums.txt
           generate_release_notes: true
           fail_on_unmatched_files: true
