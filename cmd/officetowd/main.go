@@ -263,6 +263,7 @@ func cmdSync() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			_ = cl.Heartbeat(ctx, version, stats)
 			fmt.Println()
 			fmt.Println(stats.String())
 			return nil
@@ -304,6 +305,7 @@ func cmdStart() *cobra.Command {
 				fmt.Fprintln(os.Stderr, "initial sync error:", err)
 			} else {
 				fmt.Println("[sync]", stats.String())
+				_ = cl.Heartbeat(ctx, version, stats)
 			}
 
 			// Set up watcher.
@@ -348,8 +350,13 @@ func cmdStart() *cobra.Command {
 				case <-ticker.C:
 					if stats, err := eng.Sync(ctx); err != nil {
 						fmt.Fprintln(os.Stderr, "[sync] error:", err)
-					} else if stats.Uploaded+stats.Downloaded+stats.DeletedLoc+stats.DeletedRem+stats.Conflicts > 0 {
-						fmt.Println("[sync]", stats.String())
+					} else {
+						if stats.Uploaded+stats.Downloaded+stats.DeletedLoc+stats.DeletedRem+stats.Conflicts > 0 {
+							fmt.Println("[sync]", stats.String())
+						}
+						// Report liveness on the steady ticker (~once/interval),
+						// not on every file-change sync, so heartbeats stay bounded.
+						_ = cl.Heartbeat(ctx, version, stats)
 					}
 				}
 			}

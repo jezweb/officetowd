@@ -68,13 +68,13 @@ type Object struct {
 
 // PutResult is what the worker returns from PUT /api/sync/object.
 type PutResult struct {
-	Key         string `json:"key"`
-	ETag        string `json:"etag"`
-	Size        int64  `json:"size"`
-	Hash        string `json:"hash"`
-	Repaired    bool   `json:"repaired"`
-	RepairNote  string `json:"repair_note,omitempty"`
-	AuditID     string `json:"audit_id"`
+	Key        string `json:"key"`
+	ETag       string `json:"etag"`
+	Size       int64  `json:"size"`
+	Hash       string `json:"hash"`
+	Repaired   bool   `json:"repaired"`
+	RepairNote string `json:"repair_note,omitempty"`
+	AuditID    string `json:"audit_id"`
 }
 
 // ErrNotFound is returned by Head/Get when the key doesn't exist.
@@ -252,10 +252,38 @@ func (c *Client) Delete(ctx context.Context, key, reason string) error {
 	return fmt.Errorf("delete %s: %d %s", key, resp.StatusCode, rb)
 }
 
+// Heartbeat reports a sync pass to the worker so the cortex knows the daemon is
+// alive and when it last synced. Fire-and-forget: callers ignore the error (a
+// missed heartbeat must never affect syncing).
+func (c *Client) Heartbeat(ctx context.Context, version string, stats any) error {
+	payload, err := json.Marshal(map[string]any{
+		"machine": c.MachineID,
+		"version": version,
+		"stats":   stats,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := c.authedRequest(ctx, http.MethodPost, "/api/sync/heartbeat", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("heartbeat: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // Credentials describes what `officetowd configure --from-dashboard` fetches.
 type Credentials struct {
-	WorkerURL   string `json:"worker_url"`
-	BearerHint  string `json:"bearer_hint"`
+	WorkerURL  string `json:"worker_url"`
+	BearerHint string `json:"bearer_hint"`
 }
 
 // FetchCredentials hits the worker's /api/sync/credentials endpoint.
