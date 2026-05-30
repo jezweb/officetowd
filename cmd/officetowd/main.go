@@ -354,6 +354,9 @@ func cmdStart() *cobra.Command {
 				_ = cl.Heartbeat(ctx, version, stats)
 			}
 
+			// Install/refresh the owner's Goose apps (best-effort).
+			reconcileApps(ctx, cl)
+
 			// Set up watcher.
 			w, err := watcher.New(cfg.LocalDir, watcher.Options{})
 			if err != nil {
@@ -407,6 +410,7 @@ func cmdStart() *cobra.Command {
 					// Pick up any cloud→local jobs (webhook/schedule-triggered
 					// workflows) targeted at this device and run them locally.
 					runClaimedJobs(ctx, cl, cfg.LocalDir)
+					reconcileApps(ctx, cl)
 				}
 			}
 		},
@@ -544,5 +548,34 @@ func cmdResync() *cobra.Command {
 			fmt.Println("Running fresh sync...")
 			return cmdSync().RunE(cmd, args)
 		},
+	}
+}
+
+// reconcileApps writes/removes Goose-app cache files so the owner's installed
+// app set (chosen in the dashboard) shows on Goose's Apps page. Best-effort:
+// any error is swallowed so apps never block sync.
+func reconcileApps(ctx context.Context, cl *client.Client) {
+	b, err := cl.FetchAppBundle(ctx)
+	if err != nil {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".config", "goose", "mcp-apps-cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	for _, f := range b.Install {
+		name := filepath.Base(f.Filename)
+		if name == "." || name == "/" || name == ".." {
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(dir, name), f.Content, 0o644)
+	}
+	for _, fn := range b.Remove {
+		name := filepath.Base(fn)
+		_ = os.Remove(filepath.Join(dir, name))
 	}
 }

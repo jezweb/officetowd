@@ -366,3 +366,39 @@ func (c *Client) FetchCredentials(ctx context.Context) (*Credentials, error) {
 	}
 	return &creds, nil
 }
+
+// AppCacheFile is one GooseApp cache JSON to write into Goose's apps cache.
+type AppCacheFile struct {
+	Filename string          `json:"filename"`
+	Content  json.RawMessage `json:"content"`
+}
+
+// AppBundle is the reconcile set for Goose's Apps page: files to write
+// (installed apps) + filenames to remove (catalog apps not installed).
+type AppBundle struct {
+	Dir     string         `json:"dir"`
+	Install []AppCacheFile `json:"install"`
+	Remove  []string       `json:"remove"`
+}
+
+// FetchAppBundle returns the desired Goose-app cache state for this owner.
+func (c *Client) FetchAppBundle(ctx context.Context) (*AppBundle, error) {
+	req, err := c.authedRequest(ctx, http.MethodGet, "/api/apps/cache-bundle", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("app bundle http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("app bundle: %d %s", resp.StatusCode, rb)
+	}
+	var b AppBundle
+	if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+		return nil, fmt.Errorf("app bundle decode: %w", err)
+	}
+	return &b, nil
+}
